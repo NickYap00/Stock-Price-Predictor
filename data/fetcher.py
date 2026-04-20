@@ -70,7 +70,10 @@ if __name__ == "__main__":
     # Quick smoke test
     import sys
 
-    sym = sys.argv[1] if len(sys.argv) > 1 else "AAPL"
+    if len(sys.argv) < 2:
+        print("Usage: python fetcher.py <TICKER>", file=sys.stderr)
+        sys.exit(1)
+    sym = sys.argv[1]
     df = fetch_history(FetchRequest(symbol=sym, period="1mo"))
     print(df.tail())
     print(f"\nLatest {sym} close: ${latest_price(sym):.2f}")
