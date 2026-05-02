@@ -62,7 +62,8 @@ def main() -> None:
             print(f"{sym.upper():<6} ERROR: {e}")
 
     if args.predict:
-        from data.model import predict_next_day, train
+        import pandas as pd
+        from data.model import train
 
         model_dir = Path(args.model_dir) if args.model_dir else Path("models")
         model_dir.mkdir(exist_ok=True)
@@ -77,14 +78,28 @@ def main() -> None:
             return
 
         print("\nNext-day predictions:")
+        trained_model = metrics["model"]
+        predict_X = metrics["predict_X"]
+        predict_last_dates = metrics["predict_last_dates"]
+        predicted_at = str(pd.Timestamp.now().date())
         all_preds = []
         for sym in symbols:
             try:
-                result = predict_next_day(sym, engine, model_dir=model_dir, window=args.window)
-                direction = "UP  " if result["direction"] == 1 else "DOWN"
-                conf = result["confidence"]
-                print(f"  {sym:<6} -> {direction}  (confidence: {conf:.1%})")
-                all_preds.append(result)
+                X = predict_X[sym]
+                confidence = float(trained_model.predict(X, verbose=0)[0][0])
+                direction = 1 if confidence >= 0.5 else 0
+                last_ts = predict_last_dates[sym]
+                predicted_for = str((last_ts + pd.tseries.offsets.BDay(1)).date())
+                direction_str = "UP  " if direction == 1 else "DOWN"
+                print(f"  {sym:<6} -> {direction_str}  (confidence: {confidence:.1%})")
+                all_preds.append({
+                    "symbol": sym,
+                    "predicted_for": predicted_for,
+                    "predicted_at": predicted_at,
+                    "direction": direction,
+                    "confidence": confidence,
+                    "window_size": args.window,
+                })
             except Exception as e:
                 print(f"  {sym:<6} ERROR: {e}")
 

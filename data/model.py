@@ -18,21 +18,44 @@ from tensorflow.keras import layers
 
 from data.storage import load_macd, load_prices, load_rsi
 
-FEATURE_COLS = ["close", "volume", "macd", "signal", "histogram", "rsi"]
+FEATURE_COLS = [
+    "close", "volume",
+    "macd", "signal", "histogram",
+    "rsi",
+    "momentum_5", "momentum_10",
+    "sma_ratio", "bb_pct", "volume_ratio",
+]
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 
 
-def build_features(symbol: str, engine: Engine) -> pd.DataFrame:
-    """Merge prices + MACD + RSI into one aligned DataFrame with a direction label."""
+def _load_raw_features(symbol: str, engine: Engine) -> pd.DataFrame:
+    """Load and compute all features for a symbol without direction label or dropna."""
     prices = load_prices(symbol, engine)[["close", "volume"]]
     macd_df = load_macd(symbol, engine)[["macd", "signal", "histogram"]]
     rsi_df = load_rsi(symbol, engine)[["rsi"]]
 
     df = prices.join(macd_df, how="inner").join(rsi_df, how="inner")
+
+    df["momentum_5"] = df["close"].pct_change(5)
+    df["momentum_10"] = df["close"].pct_change(10)
+
+    sma20 = df["close"].rolling(20).mean()
+    std20 = df["close"].rolling(20).std()
+    df["sma_ratio"] = df["close"] / sma20 - 1
+    df["bb_pct"] = (df["close"] - (sma20 - 2 * std20)) / (4 * std20)
+
+    vol_sma20 = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / vol_sma20 - 1
+
+    return df.dropna()
+
+
+def build_features(symbol: str, engine: Engine) -> pd.DataFrame:
+    """Merge prices + MACD + RSI into one aligned DataFrame with a direction label."""
+    df = _load_raw_features(symbol, engine)
     df["symbol"] = symbol.upper()
     df["direction"] = (df["close"].shift(-1) > df["close"]).astype("Int64")
-    df = df.dropna()
-    return df
+    return df.dropna()
 
 
 def _make_windows(arr: np.ndarray, labels: np.ndarray, window: int):
@@ -47,7 +70,7 @@ def prepare_dataset(
     symbols: list[str],
     engine: Engine,
     window: int = 20,
-    val_frac: float = 0.15,
+    val_frac: float = 0.20,
     test_frac: float = 0.15,
 ):
     """Build train/val/test splits and the predict window (last N rows per symbol).
@@ -57,6 +80,7 @@ def prepare_dataset(
     """
     train_frames, val_frames, test_frames = [], [], []
     predict_rows: dict[str, pd.DataFrame] = {}
+    predict_last_dates: dict[str, pd.Timestamp] = {}
 
     for sym in symbols:
         df = build_features(sym, engine)
@@ -67,7 +91,11 @@ def prepare_dataset(
         train_frames.append(df.iloc[:train_end])
         val_frames.append(df.iloc[train_end:val_end])
         test_frames.append(df.iloc[val_end:])
-        predict_rows[sym] = df.iloc[-window:]
+
+        # Use raw features (no direction/dropna) so today's row is included
+        raw = _load_raw_features(sym, engine)
+        predict_rows[sym] = raw.iloc[-window:]
+        predict_last_dates[sym] = raw.index[-1]
 
     scaler = MinMaxScaler()
     scaler.fit(pd.concat(train_frames)[FEATURE_COLS])
@@ -93,7 +121,7 @@ def prepare_dataset(
         scaled = scaler.transform(frame[FEATURE_COLS])
         predict_X[sym] = scaled[np.newaxis, :, :]  # shape (1, window, features)
 
-    return X_train, y_train, X_val, y_val, X_test, y_test, scaler, predict_X
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler, predict_X, predict_last_dates
 
 
 def build_model(window_size: int = 20, n_features: int = 6) -> keras.Model:
@@ -125,7 +153,7 @@ def train(
     model_dir = Path(model_dir)
     model_dir.mkdir(exist_ok=True)
 
-    X_train, y_train, X_val, y_val, X_test, y_test, scaler, _ = prepare_dataset(
+    X_train, y_train, X_val, y_val, X_test, y_test, scaler, predict_X, predict_last_dates = prepare_dataset(
         symbols, engine, window=window
     )
 
@@ -140,7 +168,7 @@ def train(
 
     callbacks = [
         keras.callbacks.EarlyStopping(
-            monitor="val_auc", patience=15, restore_best_weights=True, mode="max"
+            monitor="val_auc", patience=25, restore_best_weights=True, mode="max"
         ),
         keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=7),
     ]
@@ -156,7 +184,14 @@ def train(
     )
 
     loss, accuracy, auc = model.evaluate(X_test, y_test, verbose=0)
-    metrics = {"test_loss": loss, "test_accuracy": accuracy, "test_auc": auc}
+    metrics = {
+        "test_loss": loss,
+        "test_accuracy": accuracy,
+        "test_auc": auc,
+        "predict_X": predict_X,
+        "predict_last_dates": predict_last_dates,
+        "model": model,
+    }
 
     model.save(model_dir / "direction_model.keras")
     joblib.dump(scaler, model_dir / "scaler.pkl")
@@ -164,18 +199,32 @@ def train(
     return metrics
 
 
+def load_artifacts(model_dir: Path = DEFAULT_MODEL_DIR):
+    """Load model and scaler from disk. Call once, then pass to predict_next_day."""
+    model_dir = Path(model_dir)
+    return (
+        keras.models.load_model(model_dir / "direction_model.keras"),
+        joblib.load(model_dir / "scaler.pkl"),
+    )
+
+
 def predict_next_day(
     symbol: str,
     engine: Engine,
     model_dir: Path = DEFAULT_MODEL_DIR,
     window: int = 20,
+    model=None,
+    scaler=None,
 ) -> dict:
-    """Load saved model and predict next-day direction for a single symbol."""
-    model_dir = Path(model_dir)
-    model = keras.models.load_model(model_dir / "direction_model.keras")
-    scaler = joblib.load(model_dir / "scaler.pkl")
+    """Predict next-day direction for a single symbol.
 
-    df = build_features(symbol, engine)
+    Pass pre-loaded model and scaler to avoid reloading from disk each call.
+    """
+    if model is None or scaler is None:
+        model, scaler = load_artifacts(model_dir)
+
+    df = _load_raw_features(symbol, engine)
+
     if len(df) < window:
         raise ValueError(f"Not enough rows for {symbol} (need {window}, have {len(df)})")
 
