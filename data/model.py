@@ -14,7 +14,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers, regularizers
 
 from data.storage import load_macd, load_prices, load_rsi
 
@@ -125,12 +125,13 @@ def prepare_dataset(
 
 
 def build_model(window_size: int = 20, n_features: int = 6) -> keras.Model:
+    l2 = regularizers.l2(0.01)
     inputs = keras.Input(shape=(window_size, n_features))
-    x = layers.Conv1D(32, kernel_size=3, activation="relu", padding="causal")(inputs)
+    x = layers.Conv1D(32, kernel_size=3, activation="relu", padding="causal", kernel_regularizer=l2)(inputs)
     x = layers.Dropout(0.3)(x)
-    x = layers.Conv1D(16, kernel_size=3, activation="relu", padding="causal")(x)
+    x = layers.Conv1D(16, kernel_size=3, activation="relu", padding="causal", kernel_regularizer=l2)(x)
     x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(32, activation="relu")(x)
+    x = layers.Dense(32, activation="relu", kernel_regularizer=l2)(x)
     x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(1, activation="sigmoid")(x)
     model = keras.Model(inputs, outputs)
