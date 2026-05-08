@@ -5,3 +5,6 @@ venv/
 *.db
 .DS_Store
 ClaudePlans/
+models_highvol/
+models_lowvol/
+models/
