@@ -8,3 +8,4 @@ ClaudePlans/
 models_highvol/
 models_lowvol/
 models/
+.claude/
